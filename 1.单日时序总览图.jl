@@ -1,30 +1,35 @@
-using DataFrames
-using JSON3
+# =================================================================
+# 1_daily_overview.jl — 用户日内活跃律分析（单日时序总览图）
+# 对应 Python 脚本: 1.单日时序总览图(1).py
+# 使用 PyCall + matplotlib 实现中文绘图
+# =================================================================
+
+using JSON
 using Dates
 using Statistics
-using StatsBase
-using ImageFiltering
-using CairoMakie
-using Logging
+using Printf
+using PyCall
+
+const plt = pyimport("matplotlib.pyplot")
+const fm  = pyimport("matplotlib.font_manager")
+const np  = pyimport("numpy")
 
 # =================================================================
-# 0. 全局配置与日志系统
+# 0. 全局配置
 # =================================================================
 
-# 配置标准化的控制台日志
-global_logger(ConsoleLogger(stdout, Logging.Info))
-
-# 业务规则常量 (采用 Date 结构，哈希查找 O(1))
 const SW_VACATIONS = [
     (Date(2025, 1, 16), Date(2025, 2, 15)),
-    (Date(2025, 7, 3), Date(2025, 8, 29)),
+    (Date(2025, 7, 3),  Date(2025, 8, 29)),
     (Date(2026, 1, 22), Date(2026, 2, 28))
 ]
+
 const HOLIDAYS = Set([
     Date(2025, 4, 4), Date(2025, 4, 5), Date(2025, 4, 6), Date(2025, 5, 1),
     Date(2025, 5, 2), Date(2025, 5, 3), Date(2025, 5, 31), Date(2025, 10, 1),
     Date(2026, 1, 1)
 ])
+
 const HOLIDAYS_TO_WORK = Set([
     Date(2025, 4, 27), Date(2025, 9, 28), Date(2025, 10, 11), Date(2026, 1, 4)
 ])
@@ -32,210 +37,220 @@ const HOLIDAYS_TO_WORK = Set([
 const FEATURE_NAMES = ["进入低活期", "活跃度回升", "午休波动", "全天活跃峰值"]
 const OUTPUT_DIR = "analysis_results"
 
-function get_chinese_font()
-    """初始化绘图全局配置，确保中文字体在不同环境下尽可能加载。"""
-    font_paths = [
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/simhei.ttf",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
-    ]
+function setup_plt_configs()
+    font_paths = ["C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
+                  "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"]
     for path in font_paths
-        isfile(path) && return path
+        if isfile(path)
+            font_prop = fm.FontProperties(fname=path)
+            fname = font_prop.get_name()
+            py"""
+import matplotlib.pyplot as plt
+plt.rcParams['font.sans-serif'] = [$(fname)]
+plt.rcParams['axes.unicode_minus'] = False
+"""
+            return
+        end
     end
     @warn "未检测到预设中文字体，图表可能显示乱码。"
-    return "sans-serif"
 end
-const CHINESE_FONT = get_chinese_font()
 
 # =================================================================
-# 1. 核心算法逻辑
+# 1. 核心算法
 # =================================================================
 
+"""分类日期：SchoolDay 或 NonSchoolDay"""
 function classify_date(dt::DateTime)::String
     d = Date(dt)
-    if d in HOLIDAYS_TO_WORK
-        return "SchoolDay"
-    end
-    for (start_d, end_d) in SW_VACATIONS
-        if start_d <= d <= end_d
-            return "NonSchoolDay"
-        end
-    end
-    if d in HOLIDAYS
-        return "NonSchoolDay"
-    end
-    # dayofweek 返回 1(周一) 到 7(周日)
-    return dayofweek(d) < 6 ? "SchoolDay" : "NonSchoolDay"
+    d in HOLIDAYS_TO_WORK && return "SchoolDay"
+    any(s <= d <= e for (s, e) in SW_VACATIONS) && return "NonSchoolDay"
+    d in HOLIDAYS && return "NonSchoolDay"
+    return dayofweek(d) <= 5 ? "SchoolDay" : "NonSchoolDay"
 end
 
-function get_precise_features(y::Vector{Float64}, thresh::Float64)
-    """提取曲线特征点的精确索引位置（包含插值与极值检测）。"""
-
-    function find_intersect(arr::Vector{Float64}, val::Float64, direction::String)
-        for i in 1:(length(arr)-1)
-            if direction == "drop" && arr[i] >= val && arr[i+1] < val
-                return i + (val - arr[i]) / (arr[i+1] - arr[i])
-            elseif direction == "rise" && arr[i] <= val && arr[i+1] > val
-                return i + (val - arr[i]) / (arr[i+1] - arr[i])
+"""一维高斯滤波"""
+function gaussian_filter1d(y::Vector{Float64}, sigma::Float64)
+    radius = ceil(Int, 3 * sigma)
+    x = collect(-radius:radius)
+    kernel = exp.(-x .^ 2 ./ (2 * sigma^2))
+    kernel ./= sum(kernel)
+    n = length(y)
+    result = zeros(n)
+    for i in 1:n
+        s = 0.0
+        w = 0.0
+        for (j, kx) in enumerate(x)
+            idx = i + kx
+            if 1 <= idx <= n
+                s += y[idx] * kernel[j]
+                w += kernel[j]
             end
         end
-        return nothing
+        result[i] = s / w
     end
+    return result
+end
 
-    p1 = find_intersect(y, thresh, "drop")
-    p2 = find_intersect(y, thresh, "rise")
-
-    # 午休极值检测 (12:00-15:00 -> 对齐 Julia 1-based 索引为 73-91)
-    local_mins = Int[]
-    for i in 73:91
-        if 1 < i < length(y) && y[i-1] >= y[i] && y[i] <= y[i+1]
-            push!(local_mins, i)
+"""查找局部极小值索引（1-based）"""
+function find_local_minima(y::Vector{Float64})
+    indices = Int[]
+    for i in 2:length(y)-1
+        if y[i] < y[i-1] && y[i] < y[i+1]
+            push!(indices, i)
         end
     end
+    return indices
+end
 
-    if !isempty(local_mins)
-        # 获取局部最小值中最小的那个对应的索引
-        min_i = local_mins[argmin([y[i] for i in local_mins])]
-        p3 = Float64(min_i)
-    else
-        p3 = 82.0
+"""查找曲线穿越阈值的精确位置（返回0-based索引）"""
+function find_intersect(arr::Vector{Float64}, val::Float64, direction::Symbol)
+    for i in 1:length(arr)-1
+        if direction == :drop
+            if arr[i] >= val && arr[i+1] < val
+                return (i - 1) + (val - arr[i]) / (arr[i+1] - arr[i])
+            end
+        else
+            if arr[i] <= val && arr[i+1] > val
+                return (i - 1) + (val - arr[i]) / (arr[i+1] - arr[i])
+            end
+        end
     end
+    return nothing
+end
 
-    p4 = Float64(argmax(y))
+"""提取曲线特征点（返回0-based索引列表）"""
+function get_precise_features(y::Vector{Float64}, thresh::Float64)
+    p1 = find_intersect(y, thresh, :drop)
+    p2 = find_intersect(y, thresh, :rise)
+
+    min_idx = find_local_minima(y)
+    min_idx_0 = min_idx .- 1
+    mask = (min_idx_0 .>= 72) .& (min_idx_0 .<= 90)
+    filtered = min_idx[mask]
+    p3 = !isempty(filtered) ? Float64(filtered[argmin(y[filtered])] - 1) : 81.0
+    p4 = Float64(argmax(y) - 1)
+
     return [p1, p2, p3, p4]
 end
 
-function idx_to_time(f_idx::Union{Float64, Nothing})::String
-    """索引转 HH:MM 格式，校准 1-based index。"""
-    isnothing(f_idx) && return "--:--"
-    m = round(Int, (f_idx - 1) * 10)
-    hh = lpad(m ÷ 60, 2, '0')
-    mm = lpad(m % 60, 2, '0')
-    return "$hh:$mm"
+"""0-based索引转 HH:MM"""
+function idx_to_time(f_idx)
+    f_idx === nothing && return "--:--"
+    m = round(Int, f_idx * 10)
+    return @sprintf("%02d:%02d", m ÷ 60, m % 60)
 end
 
 # =================================================================
-# 2. 绘图任务 (Worker & Comparison)
+# 2. 绘图函数（使用 matplotlib）
 # =================================================================
 
-function draw_plot_worker(task::Dict)
-    key, conf, data = task["key"], task["conf"], task["data"]
+"""绘制单维度活跃律分析图"""
+function draw_single_plot(data::Vector{Int}, label::String, color::String, filename::String)
+    setup_plt_configs()
 
-    # 统计与平滑
-    h = fit(Histogram, data, 0:10:1440)
-    counts = h.weights
-    y_pct = sum(counts) > 0 ? (counts ./ sum(counts)) .* 100 : Float64.(counts)
+    # 统计：10分钟分箱，144个bin
+    counts = zeros(Float64, 144)
+    for m in data
+        bin_idx = m ÷ 10 + 1
+        1 <= bin_idx <= 144 && (counts[bin_idx] += 1.0)
+    end
+    total = sum(counts)
+    y_pct = total > 0 ? (counts ./ total) .* 100 : counts
+    y_smooth = gaussian_filter1d(y_pct, 2.8)
+    q25 = quantile(y_pct, 0.25)
+    q75 = quantile(y_pct, 0.75)
 
-    # 2.8 的高斯平滑核
-    kernel = Kernel.gaussian((2.8,))
-    y_smooth = imfilter(y_pct, kernel, "replicate")
-
-    q25 = percentile(y_pct, 25)
-    q75 = percentile(y_pct, 75)
-
-    # 绘图逻辑 (基于 CairoMakie)
-    fig = Figure(size = (1800, 1000), fontsize = 22, fonts=(; regular=CHINESE_FONT))
-    ax = Axis(fig[1, 1],
-        title = "用户日内活跃律分析 - $(conf["label"])",
-        titlefont = CHINESE_FONT, titlesize=30,
-        xticks = (1:12:145, ["$(lpad(h, 2, '0')):00" for h in 0:2:24]),
-        xgridvisible = false,
-        ygridstyle = :dash, ygridcolor = (:black, 0.5)
-    )
-
-    # 背景带和基准线
-    band!(ax, 1:144, fill(q25, 144), fill(q75, 144), color = ("#FFF9C4", 0.3))
-    hlines!(ax, [q25], color = "#FBC02D", linestyle = :dash, linewidth = 2.0)
-    lines!(ax, 1:144, y_smooth, color = conf["color"], linewidth = 4)
-
-    # 标注特征点
     feats = get_precise_features(y_smooth, q25)
     max_y = maximum(y_smooth)
-    ylims!(ax, -max_y * 0.2, max_y * 1.35)
 
+    fig, ax = plt.subplots(figsize=(18, 10), dpi=100)
+    ax.axhspan(q25, q75, color="#FFF9C4", alpha=0.3)
+    ax.axhline(q25, color="#FBC02D", ls="--", lw=1.2, alpha=0.7)
+    ax.plot(collect(0:143), y_smooth, color=color, lw=4, zorder=5)
+
+    # 标注特征点
     for (i, f_idx) in enumerate(feats)
-        isnothing(f_idx) && continue
-        y_val = i <= 2 ? q25 : y_smooth[round(Int, f_idx)]
+        f_idx === nothing && continue
+        y_val = i <= 2 ? q25 : y_smooth[Int(f_idx) + 1]
+        ax.plot(f_idx, y_val, "o", color=color, ms=12, mec="w", mew=2, zorder=10)
 
-        # 特征点散点
-        scatter!(ax, [f_idx], [y_val], color = conf["color"], markersize = 18, strokecolor = :white, strokewidth = 2)
-
-        # 动态偏移
         off = i >= 3 ? (0.12 * max_y) : (-0.18 * max_y)
-        align_v = i >= 3 ? :bottom : :top
-        text_y = y_val + off
-
-        # 文本与箭头
-        text!(ax, f_idx, text_y,
-            text = "$(FEATURE_NAMES[i])\n$(idx_to_time(f_idx))",
-            align = (:center, align_v),
-            color = :black, font = CHINESE_FONT, font_weight=:bold
+        ax.annotate(
+            "$(FEATURE_NAMES[i])\n$(idx_to_time(f_idx))",
+            xy=(f_idx, y_val), xytext=(f_idx, y_val + off),
+            ha="center", va=(i >= 3 ? "bottom" : "top"),
+            arrowprops=Dict("arrowstyle" => "->", "lw" => 1.2),
+            fontweight="bold",
+            bbox=Dict("boxstyle" => "round,pad=0.5", "fc" => "w", "ec" => color, "alpha" => 0.9)
         )
-        # Makie 画箭头坐标为 (起x, 起y, dx, dy)
-        arrows!(ax, [f_idx], [text_y], [0.0], [y_val - text_y], color = conf["color"], linewidth = 1.5, arrowsize=15)
     end
 
-    save_path = joinpath(OUTPUT_DIR, conf["file"])
-    save(save_path, fig)
-    @info "已生成图表: $save_path"
+    ax.set_title("用户日内活跃律分析 - $label", fontsize=22, fontweight="bold", pad=35)
+    ax.set_ylim(-max_y * 0.2, max_y * 1.35)
+    ax.set_xticks(collect(0:12:144))
+    ax.set_xticklabels([@sprintf("%02d:00", h) for h in 0:2:24])
+    ax.grid(axis="y", ls=":", alpha=0.5)
 
-    return Dict("key" => key, "y_smooth" => y_smooth, "q25" => q25, "feats" => feats)
+    save_path = joinpath(OUTPUT_DIR, filename)
+    fig.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+
+    @info "已生成图表: $save_path"
+    return Dict("y_smooth" => y_smooth, "q25" => q25, "feats" => feats)
 end
 
+"""生成对比分析图"""
 function render_comparison_plot(storage::Dict, configs::Dict)
-    fig = Figure(size = (1800, 1000), fontsize = 22, fonts=(; regular=CHINESE_FONT))
-    ax = Axis(fig[1, 1],
-        title = "校园社交平台用户日内活跃律对比分析图",
-        titlefont = CHINESE_FONT, titlesize = 30,
-        xticks = (1:12:145, ["$(lpad(h, 2, '0')):00" for h in 0:2:24]),
-        xgridvisible = false, ygridstyle = :dash, ygridcolor = (:black, 0.5)
-    )
+    setup_plt_configs()
+    fig, ax = plt.subplots(figsize=(18, 10), dpi=100)
 
-    keys_to_plot = ["SchoolDay", "NonSchoolDay"]
-    max_val_y = maximum([maximum(storage[k]["y_smooth"]) for k in keys_to_plot])
-    ylims!(ax, -max_val_y * 0.25, max_val_y * 1.35)
+    keys_list = ["SchoolDay", "NonSchoolDay"]
+    max_val_y = maximum(maximum(storage[k]["y_smooth"]) for k in keys_list)
 
-    # 绘制曲线
-    for k in keys_to_plot
-        res, conf = storage[k], configs[k]
-        lines!(ax, 1:144, res["y_smooth"], color = conf["color"], linewidth = 3.5, label = conf["label"])
-
+    for k in keys_list
+        res = storage[k]
+        ax.plot(collect(0:143), res["y_smooth"], color=configs[k]["color"], lw=3.5, label=configs[k]["label"])
         for (i, f_idx) in enumerate(res["feats"])
-            isnothing(f_idx) && continue
-            y_v = i <= 2 ? res["q25"] : res["y_smooth"][round(Int, f_idx)]
-            scatter!(ax, [f_idx], [y_v], color = conf["color"], markersize = 14, strokecolor = :white, strokewidth = 1.5)
+            f_idx === nothing && continue
+            y_v = i <= 2 ? res["q25"] : res["y_smooth"][Int(f_idx) + 1]
+            ax.plot(f_idx, y_v, "o", color=configs[k]["color"], ms=10, mec="w", mew=1.5, zorder=10)
         end
     end
 
-    # 绘制双向对比箭头标注框
+    # 对比标注框
     for i in 1:4
-        x1, x2 = storage["SchoolDay"]["feats"][i], storage["NonSchoolDay"]["feats"][i]
-        (isnothing(x1) || isnothing(x2)) && continue
+        x1 = storage["SchoolDay"]["feats"][i]
+        x2 = storage["NonSchoolDay"]["feats"][i]
+        (x1 === nothing || x2 === nothing) && continue
 
-        y1 = i <= 2 ? storage["SchoolDay"]["q25"] : storage["SchoolDay"]["y_smooth"][round(Int, x1)]
-        y2 = i <= 2 ? storage["NonSchoolDay"]["q25"] : storage["NonSchoolDay"]["y_smooth"][round(Int, x2)]
+        y1 = i <= 2 ? storage["SchoolDay"]["q25"] : storage["SchoolDay"]["y_smooth"][Int(x1) + 1]
+        y2 = i <= 2 ? storage["NonSchoolDay"]["q25"] : storage["NonSchoolDay"]["y_smooth"][Int(x2) + 1]
 
-        mid_x, mid_y = (x1 + x2) / 2, (y1 + y2) / 2
+        mid_x = (x1 + x2) / 2
+        mid_y = (y1 + y2) / 2
         v_off = i >= 3 ? (0.15 * max_val_y) : (-0.22 * max_val_y)
-        text_x, text_y = mid_x, mid_y + v_off
-        align_v = i >= 3 ? :bottom : :top
 
-        text!(ax, text_x, text_y,
-            text = FEATURE_NAMES[i],
-            align = (:center, align_v),
-            color = :black, font = CHINESE_FONT, font_weight=:bold
-        )
-
-        # 指向两个特征点的双向箭头
-        arrows!(ax, [text_x], [text_y], [x1 - text_x], [y1 - text_y], color = configs["SchoolDay"]["color"], linewidth = 1.2, arrowsize=12)
-        arrows!(ax, [text_x], [text_y], [x2 - text_x], [y2 - text_y], color = configs["NonSchoolDay"]["color"], linewidth = 1.2, arrowsize=12)
+        for (tx, ty, tcolor) in [(x1, y1, configs["SchoolDay"]["color"]), (x2, y2, configs["NonSchoolDay"]["color"])]
+            ax.annotate(
+                FEATURE_NAMES[i], xy=(tx, ty), xytext=(mid_x, mid_y + v_off),
+                ha="center", va=(i >= 3 ? "bottom" : "top"), fontweight="bold",
+                arrowprops=Dict("arrowstyle" => "->", "color" => tcolor, "lw" => 1.2),
+                bbox=Dict("boxstyle" => "round,pad=0.5", "fc" => "w", "ec" => "#333333", "alpha" => 0.9, "lw" => 1.5),
+                zorder=15
+            )
+        end
     end
 
-    axislegend(ax, position = :rb)
+    ax.set_title("校园社交平台用户日内活跃律对比分析图", fontsize=22, fontweight="bold", pad=35)
+    ax.set_ylim(-max_val_y * 0.25, max_val_y * 1.35)
+    ax.set_xticks(collect(0:12:144))
+    ax.set_xticklabels([@sprintf("%02d:00", h) for h in 0:2:24])
+    ax.grid(axis="y", ls=":", alpha=0.5)
+    ax.legend(loc="lower right", shadow=true)
 
-    save_path = joinpath(OUTPUT_DIR, "Forum_Comparison_Final.png")
-    save(save_path, fig)
-    @info "✨ 最终对比分析图渲染完成。"
+    plt.savefig(joinpath(OUTPUT_DIR, "Forum_Comparison_Final.png"), bbox_inches="tight")
+    plt.close(fig)
+    @info "最终对比分析图渲染完成。"
 end
 
 # =================================================================
@@ -243,59 +258,62 @@ end
 # =================================================================
 
 function main()
-    isdir(OUTPUT_DIR) || mkdir(OUTPUT_DIR)
-    input_file = "output.jsonl"
+    isdir(OUTPUT_DIR) || mkpath(OUTPUT_DIR)
 
+    input_file = "output.jsonl"
     if !isfile(input_file)
         @error "未发现输入文件: $input_file"
         return
     end
 
-    @info "🚀 正在加载数据..."
-    # 极速解析 JSONL 到 DataFrame
-    lines = readlines(input_file)
-    df = DataFrame(JSON3.read.(lines))
+    @info "正在加载数据..."
+    m_idx_all = Int[]
+    m_idx_school = Int[]
+    m_idx_nonschool = Int[]
 
-    # 假设 createTime 为标准的 ISO8601 或普通格式，做预处理适配 DateTime
-    clean_time_strs = replace.(String.(df.createTime), r"Z$" => "", r"\..*$" => "")
-    df.dt = parse.(DateTime, clean_time_strs)
+    open(input_file, "r") do f
+        count = 0
+        for line in eachline(f)
+            item = JSON.parse(line)
+            ct = get(item, "createTime", "")
+            isempty(ct) && continue
 
-    # 预计算日期映射优化 (Julia 也可以通过 Dict 做高速缓存查找)
-    unique_dates = unique(Date.(df.dt))
-    date_type_map = Dict(d => classify_date(DateTime(d)) for d in unique_dates)
+            dt = DateTime(ct, dateformat"yyyy-mm-dd HH:MM:SS")
+            dtype = classify_date(dt)
+            midx = hour(dt) * 60 + minute(dt)
 
-    df.type = [date_type_map[Date(d)] for d in df.dt]
-    df.m_idx = hour.(df.dt) .* 60 .+ minute.(df.dt)
+            push!(m_idx_all, midx)
+            if dtype == "SchoolDay"
+                push!(m_idx_school, midx)
+            else
+                push!(m_idx_nonschool, midx)
+            end
 
-    groups_data = Dict(
-        "Total" => df.m_idx,
-        "SchoolDay" => df[df.type .== "SchoolDay", :m_idx],
-        "NonSchoolDay" => df[df.type .== "NonSchoolDay", :m_idx]
-    )
-
-    configs = Dict(
-        "Total" => Dict("label" => "全样本总览", "color" => "#D32F2F", "file" => "Forum_Total.png"),
-        "SchoolDay" => Dict("label" => "在校上课日", "color" => "#1976D2", "file" => "Forum_School_Days.png"),
-        "NonSchoolDay" => Dict("label" => "非上课日", "color" => "#E64A19", "file" => "Forum_Non_School_Days.png")
-    )
-
-    tasks = [Dict("key" => k, "conf" => configs[k], "data" => groups_data[k]) for k in keys(configs)]
-
-    @info "🚀 启动多线程池，并行渲染 $(length(tasks)) 张基础图表..."
-    # 预分配线程安全的结果数组
-    worker_results = Vector{Dict}(undef, length(tasks))
-
-    Threads.@threads for i in 1:length(tasks)
-        worker_results[i] = draw_plot_worker(tasks[i])
+            count += 1
+            count % 50000 == 0 && @info "已加载 $count 条记录..."
+        end
+        @info "数据加载完成，共 $count 条记录"
     end
 
-    storage = Dict(res["key"] => res for res in worker_results)
+    configs = Dict(
+        "Total"        => Dict("label" => "全样本总览", "color" => "#D32F2F", "file" => "Forum_Total.png"),
+        "SchoolDay"    => Dict("label" => "在校上课日", "color" => "#1976D2", "file" => "Forum_School_Days.png"),
+        "NonSchoolDay" => Dict("label" => "非上课日",   "color" => "#E64A19", "file" => "Forum_Non_School_Days.png")
+    )
+    groups = Dict(
+        "Total"        => m_idx_all,
+        "SchoolDay"    => m_idx_school,
+        "NonSchoolDay" => m_idx_nonschool
+    )
+
+    @info "渲染 3 张基础图表..."
+    storage = Dict{String, Dict}()
+    for k in ["Total", "SchoolDay", "NonSchoolDay"]
+        storage[k] = draw_single_plot(groups[k], configs[k]["label"], configs[k]["color"], configs[k]["file"])
+    end
+
     render_comparison_plot(storage, configs)
-
-    @info "✨ 任务全部完成。"
+    @info "任务全部完成。"
 end
 
-# Julia 执行入口
-if abspath(PROGRAM_FILE) == @__FILE__
-    main()
-end
+main()
