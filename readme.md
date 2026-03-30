@@ -2,7 +2,7 @@
 
 **目的**：此项目为完成大学所修课程的大作业。用Julia语言做数据分析。
 
-**内容**：利用所在大学的一个（非官方）校园论坛小程序的帖子数据做的数据分析。（小程序链接为：mp://zuyQXrkGWpK0BMf，抓包后，实际链接为：https://api.zxs-bbs.cn/api/client/topics）
+**内容**：利用所在大学的一个（非官方）校园论坛小程序的帖子数据做的数据分析。（小程序链接为：mp://zuyQXrkGWpK0BMf，抓包后，实际链接为：https://api.zxs-bbs.cn/api/client/topics ）
 
 **补充**：由于本人初学Julia，所以先用Python尝试制作，然后再用Julia复现。
 
