@@ -33,8 +33,8 @@ CONFIG = {
     "max_report_posts": 50,  # 最终报告中每个事件展示的最大明细帖数
 
     # --- 路径与工程配置 ---
-    "input_file": 'output.jsonl',  # 输入原始数据的 JSONL 文件路径
-    "output_dir": 'analysis_results',  # 分析报告和中间结果的输出目录
+    "input_file": '../DataGet/output.jsonl',  # 输入原始数据的 JSONL 文件路径
+    "output_dir": '../analysis_results',  # 分析报告和中间结果的输出目录
     "log_interval": 30000,  # 进度汇报的记录条数间隔
     "epsilon": 1e-5,  # 避免除以零的微量常数
     "post_score_epsilon": 1e-9  # 归一化计算时的极小值

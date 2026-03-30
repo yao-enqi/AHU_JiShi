@@ -1,6 +1,5 @@
 # =================================================================
-# 2_event_detection.jl — 校园论坛异常事件监测
-# 对应 Python 脚本: 2.核心热点事件(1).py
+# event_detection.jl — 校园论坛异常事件监测
 # =================================================================
 
 using JSON
@@ -30,8 +29,8 @@ const CONFIG = Dict(
     "anomaly_sequence_gap_h" => 12,
     "max_merge_gap_hours"    => 48,
     "max_report_posts"       => 50,
-    "input_file"             => "output.jsonl",
-    "output_dir"             => "analysis_results",
+    "input_file"             =>  joinpath(@__DIR__, "..", "DataGet", "output.jsonl"),
+    "output_dir"             => joinpath(@__DIR__, "..", "analysis_results"),
     "log_interval"           => 30000,
     "epsilon"                => 1e-5,
     "post_score_epsilon"     => 1e-9

@@ -1,7 +1,5 @@
 # =================================================================
-# 1_daily_overview.jl — 用户日内活跃律分析（单日时序总览图）
-# 对应 Python 脚本: 1.单日时序总览图(1).py
-# 使用 PyCall + matplotlib 实现中文绘图
+# daily_overview.jl — 用户日内活跃律分析（单日时序总览图）
 # =================================================================
 
 using JSON
@@ -35,7 +33,7 @@ const HOLIDAYS_TO_WORK = Set([
 ])
 
 const FEATURE_NAMES = ["进入低活期", "活跃度回升", "午休波动", "全天活跃峰值"]
-const OUTPUT_DIR = "analysis_results"
+const OUTPUT_DIR =  joinpath(@__DIR__, "..", "analysis_results")
 
 function setup_plt_configs()
     font_paths = ["C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
@@ -260,7 +258,7 @@ end
 function main()
     isdir(OUTPUT_DIR) || mkpath(OUTPUT_DIR)
 
-    input_file = "output.jsonl"
+    input_file = file_path = joinpath(@__DIR__, "..", "DataGet", "output.jsonl")
     if !isfile(input_file)
         @error "未发现输入文件: $input_file"
         return

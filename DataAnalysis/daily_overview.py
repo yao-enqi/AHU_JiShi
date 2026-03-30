@@ -219,7 +219,7 @@ def main():
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
 
-    input_file = 'output.jsonl'
+    input_file = '../DataGet/output.jsonl'
     if not os.path.exists(input_file):
         logger.error(f"未发现输入文件: {input_file}")
         return
